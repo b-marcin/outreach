@@ -1,19 +1,32 @@
 import streamlit as st
-import openai
+import requests
 import re
 from typing import Dict, List, Tuple
 import json
 from datetime import datetime
 
-def init_openai() -> openai.OpenAI:
-    """Initialize OpenAI client with proper error handling."""
+def init_huggingface():
+    """Initialize Hugging Face with free API token."""
     try:
-        if 'OPENAI_API_KEY' not in st.secrets:
-            raise ValueError('OpenAI API key not found in secrets')
-        return openai.OpenAI(api_key=st.secrets['OPENAI_API_KEY'])
+        if 'HF_API_KEY' not in st.secrets:
+            # Using dummy key for demonstration - get yours from huggingface.co
+            return "hf_dummy_key"
+        return st.secrets['HF_API_KEY']
     except Exception as e:
-        st.error(f'Failed to initialize OpenAI client: {str(e)}')
+        st.error(f'Failed to initialize Hugging Face client: {str(e)}')
         st.stop()
+
+def query_free_model(prompt: str, api_key: str) -> str:
+    """Query FLAN-T5 model using Hugging Face's free inference API."""
+    API_URL = "https://api-inference.huggingface.co/models/google/flan-t5-large"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    
+    try:
+        response = requests.post(API_URL, headers=headers, json={"inputs": prompt})
+        return response.json()[0]['generated_text']
+    except Exception as e:
+        st.warning(f"Model query failed: {str(e)}")
+        return "Error generating message. Please try again."
 
 def extract_profile_sections(profile_text: str) -> Dict[str, List[str]]:
     """Extract and categorize sections from LinkedIn profile text."""
@@ -42,16 +55,16 @@ def extract_profile_sections(profile_text: str) -> Dict[str, List[str]]:
             elif 'education' in lower_line and len(line) < 30:
                 current_section = 'education'
                 continue
-            elif any(keyword in lower_line for keyword in ['skills', 'expertise', 'technologies']) and len(line) < 30:
+            elif any(keyword in lower_line for keyword in ['skills', 'expertise']) and len(line) < 30:
                 current_section = 'skills'
                 continue
-            elif any(keyword in lower_line for keyword in ['summary', 'about', 'overview']) and len(line) < 30:
+            elif any(keyword in lower_line for keyword in ['summary', 'about']) and len(line) < 30:
                 current_section = 'summary'
                 continue
-            elif any(keyword in lower_line for keyword in ['achievement', 'accomplishment', 'award']) and len(line) < 30:
+            elif any(keyword in lower_line for keyword in ['achievement', 'accomplishment']) and len(line) < 30:
                 current_section = 'achievements'
                 continue
-            elif any(keyword in lower_line for keyword in ['certification', 'license', 'qualification']) and len(line) < 30:
+            elif any(keyword in lower_line for keyword in ['certification', 'license']) and len(line) < 30:
                 current_section = 'certifications'
                 continue
                 
@@ -66,116 +79,108 @@ def extract_profile_sections(profile_text: str) -> Dict[str, List[str]]:
         st.error(f"Error extracting profile sections: {str(e)}")
         return sections
 
-def analyze_experience_relevance(experience: List[str], target_position: str, client: openai.OpenAI) -> List[Dict]:
-    """Analyze experience relevance with proper error handling."""
+def analyze_experience(experience: List[str], target_position: str) -> List[Dict]:
+    """Analyze experience locally without API calls."""
+    relevant_keywords = {
+        'developer': ['coding', 'programming', 'software', 'development', 'engineering'],
+        'manager': ['lead', 'managing', 'leadership', 'team', 'strategy'],
+        'analyst': ['analysis', 'data', 'research', 'reporting', 'metrics'],
+        # Add more role-specific keywords
+    }
+    
+    results = []
+    position_type = next((k for k in relevant_keywords.keys() if k in target_position.lower()), 'general')
+    keywords = relevant_keywords.get(position_type, [])
+    
+    for exp in experience[:3]:  # Analyze top 3 experiences
+        relevance = sum(1 for keyword in keywords if keyword in exp.lower()) * 20
+        matching_points = [
+            point for point in exp.split('. ')
+            if any(keyword in point.lower() for keyword in keywords)
+        ]
+        results.append({
+            'relevance': min(relevance + 40, 100),  # Base relevance of 40
+            'matching_points': matching_points if matching_points else [exp]
+        })
+    
+    return results
+
+def extract_achievements(experience: List[str]) -> List[str]:
+    """Extract achievements with metrics from experience."""
+    achievement_indicators = [
+        r'\d+%', r'\$\d+', r'increased', r'decreased', r'improved',
+        r'launched', r'led', r'managed', r'created', r'developed'
+    ]
+    
+    achievements = []
+    for exp in experience:
+        if any(re.search(indicator, exp.lower()) for indicator in achievement_indicators):
+            achievements.append(exp)
+    
+    return achievements[:3]
+
+def generate_message(profile_sections: Dict[str, List[str]], 
+                    target_position: str,
+                    company_highlights: str,
+                    tone: str,
+                    message_length: str,
+                    api_key: str) -> str:
+    """Generate personalized message using free model."""
     try:
-        analysis_prompt = f"""Analyze the following experience items for relevance to a {target_position} position.
-        For each experience item, provide a relevance score (0-100) and key matching points.
-        Experience items: {json.dumps(experience[:3])}"""
+        # Detailed analysis
+        experience_analysis = analyze_experience(profile_sections['experience'], target_position)
+        achievements = extract_achievements(profile_sections['experience'])
         
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are an expert technical recruiter analyzing candidate experience."},
-                {"role": "user", "content": analysis_prompt}
-            ],
-            temperature=0.7
-        )
+        # Extract key information
+        current_role = profile_sections['experience'][0] if profile_sections['experience'] else "Not specified"
+        key_skills = ', '.join(profile_sections['skills'][:5]) if profile_sections['skills'] else "relevant skills"
         
-        analysis = json.loads(response.choices[0].message.content)
-        return analysis
-    except Exception as e:
-        st.warning(f"Experience analysis failed: {str(e)}")
-        return [{"relevance": 50, "matching_points": ["Unable to analyze experience"]}]
-
-def generate_ai_message(client: openai.OpenAI, 
-                       profile_sections: Dict[str, List[str]], 
-                       target_position: str,
-                       company_highlights: str,
-                       tone: str,
-                       message_length: str) -> str:
-    """Generate personalized message with comprehensive error handling."""
-    try:
-        experience_analysis = analyze_experience_relevance(
-            profile_sections['experience'], 
-            target_position,
-            client
-        )
+        # Get most relevant experiences
+        relevant_exp = [
+            analysis['matching_points'][0] 
+            for analysis in experience_analysis 
+            if analysis['relevance'] > 60
+        ]
+        key_experience = '. '.join(relevant_exp) if relevant_exp else '. '.join(profile_sections['experience'][:2])
         
-        # Extract key achievements
-        achievements = []
-        for exp in profile_sections['experience']:
-            if any(keyword in exp.lower() for keyword in ['increased', 'decreased', 'improved', 'led', 'managed', 'created', '%', 'million', 'thousand']):
-                achievements.append(exp)
-        achievements.extend(profile_sections['achievements'])
-        key_achievements = achievements[:3]
+        # Construct prompt template
+        prompt = f"""Write a {tone.lower()} LinkedIn recruitment message for a {target_position} position.
+        Candidate currently works as: {current_role}
+        Their key skills: {key_skills}
+        Recent experience: {key_experience}
+        Company details: {company_highlights}
         
-        profile_summary = {
-            "current_role": profile_sections['experience'][0] if profile_sections['experience'] else "Not specified",
-            "key_skills": profile_sections['skills'][:5] if profile_sections['skills'] else [],
-            "experience_highlights": experience_analysis,
-            "key_achievements": key_achievements,
-            "education": profile_sections['education'][:2] if profile_sections['education'] else [],
-            "certifications": profile_sections['certifications']
-        }
+        Requirements:
+        1. Be {tone.lower()} and engaging
+        2. Reference their specific experience
+        3. Mention the opportunity clearly
+        4. Include a call to action
+        5. Keep it {message_length}
         
-        length_guides = {
-            "brief": "Keep the message concise, around 3-4 sentences.",
-            "standard": "Write a standard-length message of about 5-6 sentences.",
-            "detailed": "Create a comprehensive message with 7-8 sentences."
-        }
-
-        prompt = f"""As a technical recruiter, write a highly personalized LinkedIn outreach message for a {target_position} position.
-
-Profile Information:
-{json.dumps(profile_summary, indent=2)}
-
-Company Information:
-{company_highlights}
-
-Requirements:
-1. Tone: {tone}
-2. Length: {length_guides[message_length]}
-3. Must include:
-   - Specific reference to their most relevant experience
-   - Mention of their key achievements
-   - Clear value proposition about the opportunity
-   - Compelling reason why their background makes them an excellent fit
-4. Formatting:
-   - Use short paragraphs for readability
-   - Include a clear call to action
-   - End with a professional signature
-5. Style:
-   - Be genuine and conversational
-   - Avoid recruiting clichés
-   - Show you've done your research
-   - Create urgency without being pushy
-
-Format the message ready to send, starting with "Hi [Name]" and ending with a signature."""
-
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are an expert technical recruiter known for writing highly engaging, personalized outreach messages that achieve exceptional response rates."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            max_tokens=600
-        )
-        return response.choices[0].message.content
+        Write the message:"""
+        
+        # Get response from free model
+        message = query_free_model(prompt, api_key)
+        
+        # Format the message
+        message = message.replace('\\n', '\n')
+        if not message.startswith('Hi') and not message.startswith('Dear'):
+            message = 'Hi [Name],\n\n' + message
+        
+        return message
     except Exception as e:
         st.error(f"Error generating message: {str(e)}")
         return None
 
 def main():
-    """Main application flow with proper error handling."""
+    """Main application flow with free AI integration."""
     try:
         # Initialize session state
         if 'message_history' not in st.session_state:
             st.session_state.message_history = []
 
-        st.title("Advanced AI Recruitment Message Generator")
-        st.write("Generate highly personalized outreach messages that get responses")
+        st.title("Free AI Recruitment Message Generator")
+        st.write("Generate personalized outreach messages using free AI models")
 
         # Sidebar settings
         with st.sidebar:
@@ -194,18 +199,11 @@ def main():
             with st.expander("💡 Writing Tips"):
                 st.markdown("""
                 **For Better Results:**
-                - Include specific achievements and metrics
-                - Add certifications and qualifications
-                - Mention recent projects and technologies
-                - Include team size and impact details
+                - Include specific achievements
+                - Add certifications
+                - List key technologies
+                - Mention team size and impact
                 """)
-            
-            st.markdown("---")
-            if st.session_state.message_history:
-                st.markdown("### Recent Messages")
-                for msg in st.session_state.message_history[-5:]:
-                    with st.expander(f"{msg['position']} - {msg['timestamp']:%H:%M}"):
-                        st.text_area("", msg['message'], height=100, key=f"history_{msg['timestamp']}")
 
         # Main content area
         col1, col2 = st.columns([2, 1])
@@ -221,7 +219,7 @@ def main():
                 "Company/Role Highlights",
                 height=100,
                 help="Add key selling points about your company and the role",
-                placeholder="E.g., Fast-growing startup, remote-first culture, cutting-edge tech stack..."
+                placeholder="E.g., Fast-growing startup, remote-first culture..."
             )
 
         with col2:
@@ -237,29 +235,28 @@ def main():
                     len(sections['experience']) > 0,
                     len(sections['skills']) > 0,
                     len(sections['education']) > 0,
-                    len(sections['summary']) > 0,
-                    len(sections['achievements']) > 0
-                ]) * 20
+                    len(sections['summary']) > 0
+                ]) * 25
                 
                 st.progress(quality_score / 100)
                 st.text(f"Profile Completeness: {quality_score}%")
                 
-                if quality_score < 60:
-                    st.warning("Add more profile details for better personalization")
+                if quality_score < 75:
+                    st.warning("Add more profile details for better results")
 
         # Generate message
         if st.button("Generate Message") and profile_text and target_position:
-            client = init_openai()
+            api_key = init_huggingface()
             profile_sections = extract_profile_sections(profile_text)
             
-            with st.spinner("Analyzing profile and generating personalized message..."):
-                message = generate_ai_message(
-                    client,
+            with st.spinner("Generating personalized message..."):
+                message = generate_message(
                     profile_sections,
                     target_position,
                     company_highlights,
                     tone,
-                    message_length
+                    message_length,
+                    api_key
                 )
             
             if message:
@@ -272,19 +269,6 @@ def main():
                     'message': message,
                     'position': target_position
                 })
-                
-                # Show analysis
-                with st.expander("View Profile Analysis"):
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.markdown("**Key Skills Identified:**")
-                        for skill in profile_sections['skills'][:5]:
-                            st.markdown(f"- {skill}")
-                    
-                    with col2:
-                        st.markdown("**Experience Highlights:**")
-                        for exp in profile_sections['experience'][:3]:
-                            st.markdown(f"- {exp}")
 
         # Setup instructions
         st.markdown("---")
@@ -292,20 +276,24 @@ def main():
             st.markdown("""
             To run this app locally:
             
-            1. Save this code in a file named `app.py`
+            1. Save this code as `app.py`
             2. Install required packages:
                ```bash
-               pip install streamlit openai
+               pip install streamlit requests
                ```
-            3. Create a `.streamlit/secrets.toml` file:
+            3. Optional: Create a free Hugging Face account and get an API token
+            4. Create `.streamlit/secrets.toml`:
                ```toml
-               OPENAI_API_KEY = "your-api-key-here"
+               HF_API_KEY = "your-huggingface-token"  # Optional
                ```
-            4. Run the app:
+            5. Run the app:
                ```bash
                streamlit run app.py
                ```
+            
+            Note: Even without a Hugging Face token, the app will work with limited requests.
             """)
+
     except Exception as e:
         st.error(f"Application error: {str(e)}")
 
