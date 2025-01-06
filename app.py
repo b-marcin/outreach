@@ -1,6 +1,16 @@
 import streamlit as st
+import openai
 import re
 from typing import Dict, List
+import json
+from datetime import datetime
+
+def init_openai():
+    """Initialize OpenAI client with API key from Streamlit secrets."""
+    if 'OPENAI_API_KEY' not in st.secrets:
+        st.error('OpenAI API key not found. Please add it to your secrets.')
+        st.stop()
+    return openai.OpenAI(api_key=st.secrets['OPENAI_API_KEY'])
 
 def extract_profile_sections(profile_text: str) -> Dict[str, List[str]]:
     """
@@ -14,7 +24,6 @@ def extract_profile_sections(profile_text: str) -> Dict[str, List[str]]:
         'summary': ''
     }
     
-    # Split text into lines and process
     lines = profile_text.split('\n')
     current_section = None
     
@@ -23,7 +32,6 @@ def extract_profile_sections(profile_text: str) -> Dict[str, List[str]]:
         if not line:
             continue
             
-        # Identify sections based on common LinkedIn headers
         lower_line = line.lower()
         if 'experience' in lower_line and len(line) < 30:
             current_section = 'experience'
@@ -38,7 +46,6 @@ def extract_profile_sections(profile_text: str) -> Dict[str, List[str]]:
             current_section = 'summary'
             continue
             
-        # Add content to appropriate section
         if current_section:
             if current_section == 'summary':
                 sections[current_section] += line + ' '
@@ -47,46 +54,91 @@ def extract_profile_sections(profile_text: str) -> Dict[str, List[str]]:
     
     return sections
 
-def generate_outreach_message(profile_sections: Dict[str, List[str]], target_position: str) -> str:
+def generate_ai_message(client: openai.OpenAI, 
+                       profile_sections: Dict[str, List[str]], 
+                       target_position: str,
+                       tone: str,
+                       message_length: str) -> str:
     """
-    Generate a personalized outreach message based on profile sections and target position.
+    Generate a personalized outreach message using OpenAI's API.
     """
-    # Extract name (assuming it's the first line of experience or summary)
-    name = "the candidate"
-    if profile_sections['experience']:
-        name_match = re.search(r'^([A-Za-z]+(?:\s[A-Za-z]+)?)', profile_sections['experience'][0])
-        if name_match:
-            name = name_match.group(1)
+    # Create a structured profile summary
+    profile_summary = {
+        "current_role": profile_sections['experience'][0] if profile_sections['experience'] else "Not specified",
+        "key_skills": profile_sections['skills'][:5] if profile_sections['skills'] else [],
+        "experience_highlights": profile_sections['experience'][:3] if profile_sections['experience'] else [],
+        "education": profile_sections['education'][:2] if profile_sections['education'] else []
+    }
     
-    # Extract current role
-    current_role = "professional"
-    if profile_sections['experience']:
-        current_role = profile_sections['experience'][0].split(' at ')[0]
-    
-    # Extract relevant skills
-    skills = profile_sections['skills'][:3] if profile_sections['skills'] else []
-    skills_str = ", ".join(skills) if skills else "relevant experience"
-    
-    # Generate message
-    message = f"""Hi {name},
+    # Define length parameters
+    length_guides = {
+        "brief": "Keep the message concise, around 2-3 sentences.",
+        "standard": "Write a standard-length message of about 4-5 sentences.",
+        "detailed": "Create a comprehensive message with 6-7 sentences."
+    }
 
-I hope this message finds you well! I'm a technical recruiter and I came across your profile. I'm particularly impressed by your experience as a {current_role} and your expertise in {skills_str}.
+    # Construct the prompt
+    prompt = f"""As a technical recruiter, write a personalized LinkedIn outreach message for a {target_position} position.
 
-We have an exciting opportunity for a {target_position} role that I believe would be a great fit for someone with your background. I'd love to connect and share more details about this position and learn about your career interests.
+Profile Information:
+{json.dumps(profile_summary, indent=2)}
 
-Would you be open to a brief conversation about this opportunity?
+Requirements:
+1. Tone: {tone}
+2. Length: {length_guides[message_length]}
+3. Must mention specific aspects of their background that make them a good fit
+4. Include a clear call to action
+5. Keep it professional but conversational
+6. Don't use cliche recruiting phrases
+7. Make specific references to their experience and skills
 
-Looking forward to hearing from you!
+Format the message ready to send, starting with "Hi [Name]" and ending with a signature."""
 
-Best regards"""
-    
-    return message
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are an experienced technical recruiter who writes personalized, engaging outreach messages."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=500
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        st.error(f"Error generating message: {str(e)}")
+        return None
+
+# Initialize session state for message history
+if 'message_history' not in st.session_state:
+    st.session_state.message_history = []
 
 # Streamlit UI
-st.title("LinkedIn Outreach Message Generator")
-st.write("Generate personalized recruitment messages based on LinkedIn profiles")
+st.title("AI-Powered LinkedIn Outreach Generator")
+st.write("Generate personalized recruitment messages using AI")
 
-# Input sections
+# Settings and input section
+with st.sidebar:
+    st.header("Message Settings")
+    tone = st.select_slider(
+        "Message Tone",
+        options=["Professional", "Friendly", "Casual"],
+        value="Professional"
+    )
+    
+    message_length = st.select_slider(
+        "Message Length",
+        options=["brief", "standard", "detailed"],
+        value="standard"
+    )
+    
+    st.markdown("---")
+    st.markdown("### Message History")
+    for msg in st.session_state.message_history[-5:]:
+        st.text(f"{msg['timestamp']:%H:%M:%S}")
+        st.text_area("", msg['message'], height=100, key=f"history_{msg['timestamp']}")
+
+# Main content area
 col1, col2 = st.columns([2, 1])
 
 with col1:
@@ -105,47 +157,68 @@ with col2:
     st.markdown("### Tips for best results:")
     st.markdown("""
     - Include the full profile text
-    - Make sure sections like Experience, Education, and Skills are included
-    - Keep section headers in their original format
+    - Ensure experience and skills sections are included
+    - More detail leads to better personalization
     """)
 
-# Generate button
+# Generate button and output
 if st.button("Generate Message") and profile_text and target_position:
-    # Process profile and generate message
-    profile_sections = extract_profile_sections(profile_text)
-    message = generate_outreach_message(profile_sections, target_position)
-    
-    # Display generated message
-    st.markdown("### Generated Message:")
-    st.text_area("", message, height=300)
-    
-    # Add copy button
-    st.markdown("Click the copy icon in the top-right of the message box to copy to clipboard")
-    
-    # Display extracted sections for verification
-    with st.expander("View Extracted Profile Sections"):
-        for section, content in profile_sections.items():
-            st.markdown(f"**{section.title()}:**")
-            if isinstance(content, list):
-                for item in content:
-                    st.markdown(f"- {item}")
-            else:
-                st.markdown(content)
+    try:
+        client = init_openai()
+        profile_sections = extract_profile_sections(profile_text)
+        
+        with st.spinner("Generating personalized message..."):
+            message = generate_ai_message(
+                client,
+                profile_sections,
+                target_position,
+                tone,
+                message_length
+            )
+        
+        if message:
+            st.markdown("### Generated Message:")
+            st.text_area("", message, height=300)
+            
+            # Save to history
+            st.session_state.message_history.append({
+                'timestamp': datetime.now(),
+                'message': message,
+                'position': target_position
+            })
+            
+            # Show extracted sections for verification
+            with st.expander("View Extracted Profile Sections"):
+                for section, content in profile_sections.items():
+                    st.markdown(f"**{section.title()}:**")
+                    if isinstance(content, list):
+                        for item in content:
+                            st.markdown(f"- {item}")
+                    else:
+                        st.markdown(content)
 
-# Add instructions for installation and running
+# Setup instructions
 st.markdown("---")
 with st.expander("Installation & Usage Instructions"):
     st.markdown("""
     To run this app locally:
     
     1. Save this code in a file named `app.py`
-    2. Install required package:
+    
+    2. Install required packages:
+       ```bash
+       pip install streamlit openai
        ```
-       pip install streamlit
+    
+    3. Create a `.streamlit/secrets.toml` file in your project directory:
+       ```toml
+       OPENAI_API_KEY = "your-api-key-here"
        ```
-    3. Run the app:
-       ```
+    
+    4. Run the app:
+       ```bash
        streamlit run app.py
        ```
-    4. The app will open in your default web browser
+    
+    5. The app will open in your default web browser
     """)
